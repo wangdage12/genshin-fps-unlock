@@ -1,5 +1,13 @@
 # 原神解锁FPS限制
 
+适用于Snap Hutao的修改版
+
+在 MSYS2 MinGW64 终端，进入项目目录后执行：
+```sh
+g++ main.cpp -o unlockfps.exe -std=gnu++17 -static -static-libgcc -static-libstdc++
+```
+即可编译
+
 ver 6.0 未有新的更新，直接用最新release即可。
 <img width="1477" height="660" alt="image" src="https://github.com/user-attachments/assets/2f114930-7b4f-4748-ade3-dab8741f1b72" />
 **2025年11月15日再测试看，改为120帧左右看起来是稳定了，不建议再上调**

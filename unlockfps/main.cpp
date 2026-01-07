@@ -231,22 +231,40 @@ DWORD GetPID(std::string ProcessName)
 
 bool WriteConfig(std::string GamePath, int fps)
 {
-    HANDLE hFile = CreateFileA("fps_config.ini", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_HIDDEN, nullptr);
+    // 验证输入参数
+    if (GamePath.empty() || GamePath.length() < 8)
+    {
+        printf("错误：游戏路径无效，无法写入配置\n");
+        return false;
+    }
+
+    // 只用普通属性创建，不再尝试隐藏属性，隐藏的文件可能会引起权限问题
+    HANDLE hFile = CreateFileA("fps_config.ini", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE)
     {
         DWORD code = GetLastError();
         printf("CreateFileA failed (%d): %s\n", code, GetLastErrorAsString(code).c_str());
+        printf("无法创建配置文件，请检查当前目录是否有写入权限\n");
         return false;
     }
 
     std::string content{};
     content = "[Setting]\n";
     content += "Path=" + GamePath + "\n";
-    content += "FPS=" + std::to_string(fps);
+    content += "FPS=" + std::to_string(fps) + "\n";
 
     DWORD written = 0;
-    WriteFile(hFile, content.data(), content.size(), &written, nullptr);
+    BOOL result = WriteFile(hFile, content.data(), (DWORD)content.size(), &written, nullptr);
     CloseHandle(hFile);
+    
+    if (!result || written != content.size())
+    {
+        DWORD code = GetLastError();
+        printf("WriteFile failed (%d): %s\n", code, GetLastErrorAsString(code).c_str());
+        return false;
+    }
+    
+    return true;
 }
 //Hotpatch
 static DWORD64 inject_patch(LPVOID text_buffer, DWORD text_size, DWORD64 _text_baseaddr, uint64_t _ptr_fps, HANDLE Tar_handle)
@@ -327,49 +345,98 @@ __Get_fpsSet_addr:
 
 void LoadConfig()
 {
+    HANDLE hProcess = nullptr;
     if (GetFileAttributesA("config") != INVALID_FILE_ATTRIBUTES)
         DeleteFileA("config");
 
     INIReader reader("fps_config.ini");
     if (reader.ParseError() != 0)
     {
-        printf("配置不存在\n请不要关闭此进程 - 然后手动开启游戏\n这只需要进行一次 - 用于获取游戏路经\n");
+        printf("配置不存在\n请不要关闭此进程 - 然后手动开启游戏\n这只需要进行一次 - 用于获取游戏路径\n");
         printf("\n等待游戏启动...\n");
 
         DWORD pid = 0;
         while (!(pid = GetPID("YuanShen.exe")) && !(pid = GetPID("GenshinImpact.exe")))
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        // 获取进程句柄 - 这权限很低的了 - 不应该获取不了
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
-        if (!hProcess)
+        if (pid == 0)
         {
-            DWORD code = GetLastError();
-            printf("OpenProcess failed (%d): %s", code, GetLastErrorAsString(code).c_str());
+            printf("未找到游戏进程，请确保游戏已启动\n");
             return;
         }
 
-        char szPath[MAX_PATH]{};
+        int retryCount = 0;
+        while (retryCount < 3 && !hProcess)
+        {
+            hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE, FALSE, pid);
+            if (!hProcess)
+            {
+                DWORD code = GetLastError();
+                printf("OpenProcess 尝试 %d 失败 (%d): %s\n", retryCount + 1, code, GetLastErrorAsString(code).c_str());
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                retryCount++;
+            }
+        }
+
+        if (!hProcess)
+        {
+            DWORD code = GetLastError();
+            printf("OpenProcess 最终失败 (%d): %s\n", code, GetLastErrorAsString(code).c_str());
+            printf("请尝试以管理员权限运行此程序\n");
+            return;
+        }
+
+        char szPath[MAX_PATH * 2]{};  // 增大缓冲区
         DWORD length = sizeof(szPath);
-        QueryFullProcessImageNameA(hProcess, 0, szPath, &length);
+        if (!QueryFullProcessImageNameA(hProcess, 0, szPath, &length))
+        {
+            DWORD code = GetLastError();
+            printf("QueryFullProcessImageNameA 失败 (%d): %s\n", code, GetLastErrorAsString(code).c_str());
+            CloseHandle(hProcess);
+            return;
+        }
+
+        // 验证路径是否有效
+        if (length < 5 || strlen(szPath) < 5)
+        {
+            printf("获取到的游戏路径太短或无效: %s\n", szPath);
+            CloseHandle(hProcess);
+            return;
+        }
 
         GamePath = szPath;
-        WriteConfig(GamePath, FpsValue);
+        printf("获取到游戏路径: %s\n", GamePath.c_str());
+        
+        if (!WriteConfig(GamePath, FpsValue))
+        {
+            printf("写入配置文件失败\n");
+            CloseHandle(hProcess);
+            return;
+        }
 
         HWND hwnd = nullptr;
-        while (!(hwnd = FindWindowA("UnityWndClass", nullptr)))
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-        DWORD ExitCode = STILL_ACTIVE;
-        while (ExitCode == STILL_ACTIVE)
+        int findWindowRetry = 0;
+        while (!(hwnd = FindWindowA("UnityWndClass", nullptr)) && findWindowRetry < 50)
         {
-            SendMessageA(hwnd, WM_CLOSE, 0, 0);
-            GetExitCodeProcess(hProcess, &ExitCode);
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            findWindowRetry++;
+        }
+
+        if (hwnd)
+        {
+            DWORD ExitCode = STILL_ACTIVE;
+            int closeRetry = 0;
+            while (ExitCode == STILL_ACTIVE && closeRetry < 20)
+            {
+                SendMessageA(hwnd, WM_CLOSE, 0, 0);
+                GetExitCodeProcess(hProcess, &ExitCode);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                closeRetry++;
+            }
         }
 
         // wait for the game to close then continue
-        WaitForSingleObject(hProcess, -1);
+        WaitForSingleObject(hProcess, 5000);  // 最多等待5秒
         CloseHandle(hProcess);
 
         system("cls");
@@ -379,11 +446,62 @@ void LoadConfig()
     GamePath = reader.Get("Setting", "Path", "");
     FpsValue = reader.GetInteger("Setting", "FPS", FpsValue);
 
+    printf("读取配置: Path=%s, FPS=%d\n", GamePath.c_str(), FpsValue);
+
+    // 更严格的路径验证
+    if (GamePath.length() < 8 || GamePath.empty())
+    {
+        printf("错误：游戏路径太短或无效 - %s\n", GamePath.c_str());
+        printf("请检查配置文件中的游戏路径是否正确\n");
+        DeleteFileA("fps_config.ini");
+        LoadConfig();
+        return;
+    }
+
+    if (GamePath.find(".exe") == std::string::npos)
+    {
+        printf("错误：游戏路径不是有效的可执行文件 - %s\n", GamePath.c_str());
+        printf("请确保路径指向 GenshinImpact.exe 或 YuanShen.exe\n");
+        DeleteFileA("fps_config.ini");
+        LoadConfig();
+        return;
+    }
+
     if (GetFileAttributesA(GamePath.c_str()) == INVALID_FILE_ATTRIBUTES)
     {
-        printf("配置里的游戏路经改变了 - 开始重新配置\n");
-        DeleteFileA("config.ini");
+        DWORD error = GetLastError();
+        printf("错误：配置里的游戏路径不存在 - %s\n", GamePath.c_str());
+        printf("错误代码: %d\n", error);
+
+        size_t lastSlash = GamePath.find_last_of("\\");
+        if (lastSlash != std::string::npos)
+        {
+            std::string dirPath = GamePath.substr(0, lastSlash);
+            if (GetFileAttributesA(dirPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+            {
+                printf("错误：游戏目录也不存在 - %s\n", dirPath.c_str());
+            }
+            else
+            {
+                printf("游戏目录存在，但文件不存在\n");
+                WIN32_FIND_DATAA findData;
+                HANDLE hFind = FindFirstFileA((dirPath + "\\*.exe").c_str(), &findData);
+                if (hFind != INVALID_HANDLE_VALUE)
+                {
+                    printf("目录中的可执行文件:\n");
+                    do
+                    {
+                        printf("  %s\n", findData.cFileName);
+                    } while (FindNextFileA(hFind, &findData));
+                    FindClose(hFind);
+                }
+            }
+        }
+        
+        printf("请检查配置文件中的游戏路径是否正确\n");
+        DeleteFileA("fps_config.ini");
         LoadConfig();
+        return;
     }
 }
 
@@ -396,9 +514,22 @@ DWORD __stdcall Thread1(LPVOID p)
     int* pTargetFPS = (int*)p;
     int fps = *pTargetFPS;
     int prev = fps;
+    
+    // 添加配置文件监控
+    FILETIME lastConfigWriteTime = {0};
+    WIN32_FILE_ATTRIBUTE_DATA fileData;
+    if (GetFileAttributesExA("fps_config.ini", GetFileExInfoStandard, &fileData))
+    {
+        lastConfigWriteTime = fileData.ftLastWriteTime;
+    }
+    
+    int configCheckCounter = 0;
+    
     while (true)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        
+        // 检查热键
         if (GetAsyncKeyState(KEY_DECREASE) & 1 && GetAsyncKeyState(VK_RCONTROL) & 0x8000)
             fps -= 20;
         if (GetAsyncKeyState(KEY_DECREASE_SMALL) & 1 && GetAsyncKeyState(VK_RCONTROL) & 0x8000)
@@ -409,6 +540,34 @@ DWORD __stdcall Thread1(LPVOID p)
             fps += 2;
         if (GetAsyncKeyState(KEY_TOGGLE) & 1)
             fps = fps != 60 ? 60 : prev;
+            
+        // 每500ms检查一次配置文件是否更新
+        configCheckCounter++;
+        if (configCheckCounter >= 31) // 16ms * 31 ≈ 500ms
+        {
+            configCheckCounter = 0;
+            if (GetFileAttributesExA("fps_config.ini", GetFileExInfoStandard, &fileData))
+            {
+                // 比较文件修改时间
+                if (CompareFileTime(&fileData.ftLastWriteTime, &lastConfigWriteTime) > 0)
+                {
+                    // 配置文件已更新，重新读取
+                    INIReader reader("fps_config.ini");
+                    if (reader.ParseError() == 0)
+                    {
+                        int newFps = reader.GetInteger("Setting", "FPS", fps);
+                        if (newFps != fps)
+                        {
+                            fps = newFps;
+                            if (fps < 60)
+                                fps = 60;
+                        }
+                    }
+                    lastConfigWriteTime = fileData.ftLastWriteTime;
+                }
+            }
+        }
+        
         if (prev != fps)
             WriteConfig(GamePath, fps);
         if (fps > 60)
@@ -423,6 +582,8 @@ DWORD __stdcall Thread1(LPVOID p)
 }
 int main(int argc, char** argv)
 {
+    SetConsoleOutputCP(CP_UTF8); 
+    SetConsoleCP(CP_UTF8);       
     std::atexit([] {
         system("pause");
     });
@@ -442,15 +603,74 @@ int main(int argc, char** argv)
     std::string ProcessPath = GamePath;
     std::string ProcessDir{};
 
-    if (ProcessPath.length() < 8)
+    // 更严格的路径验证
+    if (ProcessPath.length() < 8 || ProcessPath.empty())
+    {
+        printf("错误：游戏路径太短或无效 (长度: %zu)\n", ProcessPath.length());
+        printf("当前路径: '%s'\n", ProcessPath.c_str());
+        printf("请检查配置文件中的游戏路径是否正确\n");
+        system("pause");
         return 0;
+    }
+
+    // 检查路径是否包含可执行文件
+    if (ProcessPath.find(".exe") == std::string::npos)
+    {
+        printf("错误：游戏路径不是有效的可执行文件\n");
+        printf("当前路径: '%s'\n", ProcessPath.c_str());
+        printf("请确保路径指向 GenshinImpact.exe 或 YuanShen.exe\n");
+        system("pause");
+        return 0;
+    }
 
     printf("FPS解锁 好用的话点个star吧 5.5\n");
+    printf("适用于Snap Hutao的版本：https://github.com/wangdage12/genshin-fps-unlock\n");
     printf("https://github.com/xiaonian233/genshin-fps-unlock \n特别感谢winTEuser老哥 \n");
-    printf("游戏路经: %s\n\n", ProcessPath.c_str());
+    printf("游戏路径: %s\n\n", ProcessPath.c_str());
+    
+    // 检查游戏文件是否存在
+    DWORD fileAttributes = GetFileAttributesA(ProcessPath.c_str());
+    if (fileAttributes == INVALID_FILE_ATTRIBUTES)
+    {
+        DWORD error = GetLastError();
+        printf("错误：游戏文件不存在 - %s\n", ProcessPath.c_str());
+        printf("错误代码: %d\n", error);
+        
+        // 尝试检查路径中的各个部分
+        std::string dirPath = ProcessPath.substr(0, ProcessPath.find_last_of("\\"));
+        if (GetFileAttributesA(dirPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            printf("错误：游戏目录也不存在 - %s\n", dirPath.c_str());
+        }
+        else
+        {
+            printf("游戏目录存在，但文件不存在\n");
+            // 列出目录中的文件
+            WIN32_FIND_DATAA findData;
+            HANDLE hFind = FindFirstFileA((dirPath + "\\*").c_str(), &findData);
+            if (hFind != INVALID_HANDLE_VALUE)
+            {
+                printf("目录中的文件:\n");
+                do
+                {
+                    printf("  %s\n", findData.cFileName);
+                } while (FindNextFileA(hFind, &findData));
+                FindClose(hFind);
+            }
+        }
+        
+        system("pause");
+        return 0;
+    }
+    else
+    {
+        printf("游戏文件存在，属性: %d\n", fileAttributes);
+    }
+    
     ProcessDir = ProcessPath.substr(0, ProcessPath.find_last_of("\\"));
     std::string procname = ProcessPath.substr(ProcessPath.find_last_of("\\") + 1);
 
+    printf("检查游戏进程: %s\n", procname.c_str());
     DWORD pid = GetPID(procname);
     if (pid)
     {
