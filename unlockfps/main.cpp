@@ -682,7 +682,15 @@ int main(int argc, char** argv)
 
     STARTUPINFOA si{};
     PROCESS_INFORMATION pi{};
-    if (!CreateProcessA(ProcessPath.c_str(), (LPSTR)CommandLine.c_str(), nullptr, nullptr, FALSE, 0, nullptr, ProcessDir.c_str(), &si, &pi))
+
+    // 构建完整的命令行：可执行文件路径 + 参数
+    std::string FullCommandLine = "\"" + ProcessPath + "\"";
+    if (!CommandLine.empty())
+    {
+        FullCommandLine += " " + CommandLine;
+    }
+
+    if (!CreateProcessA(nullptr, (LPSTR)FullCommandLine.c_str(), nullptr, nullptr, FALSE, 0, nullptr, ProcessDir.c_str(), &si, &pi))
     {
         DWORD code = GetLastError();
         printf("CreateProcess failed (%d): %s", code, GetLastErrorAsString(code).c_str());
